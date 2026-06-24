@@ -230,6 +230,130 @@ def mock_result() -> dict:
     }
 
 
+def _split_turns(transcript: str):
+    """把转写按行拆成 (说话人, 内容)。识别不出说话人就标 '未知'。"""
+    turns = []
+    for raw in transcript.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        # 去掉行首的时间戳，如 00:01 / 00:01:23
+        line = re.sub(r"^\d{1,2}:\d{2}(:\d{2})?\s*", "", line)
+        speaker = "未知"
+        m = re.match(r"^(销售|业务|顾问|客服|我方|我|sales)\s*[:：、\-\s]\s*(.+)$", line, re.I)
+        if m:
+            speaker, line = "销售", m.group(2).strip()
+        else:
+            m = re.match(r"^(客户|顾客|对方|客|买家|customer)\s*[:：、\-\s]\s*(.+)$", line, re.I)
+            if m:
+                speaker, line = "客户", m.group(2).strip()
+        if line:
+            turns.append((speaker, line))
+    return turns
+
+
+def _dedup(seq, limit=6):
+    out = []
+    for x in seq:
+        x = x.strip("　 ,，。.!！?？")
+        if x and x not in out:
+            out.append(x)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def heuristic_result(transcript: str) -> dict:
+    """不调用 AI，用关键词规则分析「真实上传的内容」，给出一份基础复盘。
+    结果不如大模型细致，但完全离线、免费、且基于客户的真实文件。"""
+    turns = _split_turns(transcript)
+    cust = [t for s, t in turns if s == "客户"]
+    sales = [t for s, t in turns if s == "销售"]
+    # 没识别出说话人时，退化为对整段文字做关键词扫描
+    all_lines = [t for _, t in turns] or [l.strip() for l in transcript.splitlines() if l.strip()]
+    cust_lines = cust or all_lines
+
+    NEED = ["想要", "需要", "希望", "想", "头疼", "最", "能不能", "可不可以", "有没有", "要", "解决", "管理"]
+    OBJ = ["担心", "顾虑", "怕", "不敢", "太贵", "贵", "太高", "比预期", "预期高", "售后", "差", "犹豫",
+           "再看看", "再考虑", "考虑", "商量", "不确定", "麻烦", "问题", "不放心", "折腾"]
+    BUDGET = ["预算", "价格", "报价", "多少钱", "多少", "费用", "成本", "优惠", "便宜"]
+    OVER = ["保证", "绝对", "百分百", "100%", "一定", "肯定", "立刻", "马上", "稳赚", "永久"]
+    VALUE = ["相当于", "帮您", "帮你", "省", "节省", "提升", "数据", "一个后台", "降低", "多请"]
+
+    def hits(lines, kws):
+        return [l for l in lines if any(k in l for k in kws)]
+
+    demand = _dedup(hits(cust_lines, NEED), 5)
+    objections = _dedup(hits(cust_lines, OBJ), 5)
+    budget_hit = hits(all_lines, BUDGET)
+    budget = budget_hit[0] if budget_hit else "未明确（通话中未谈到明确预算/报价）"
+
+    # 合规：销售方是否有过度承诺
+    over_hits = _dedup(hits(sales or all_lines, OVER), 4)
+    compliance = ([f"疑似过度承诺：「{x}」，建议改成留有余地的说法（如'通常…，视情况而定'）" for x in over_hits]
+                  or ["未发现明显违规话术（基础规则检查）"])
+
+    # 做得好的地方
+    did_well = []
+    if any("?" in l or "？" in l or l.endswith("吗") or "请问" in l for l in (sales or [])):
+        did_well.append("有主动向客户提问、确认需求")
+    if sales and any(k in sales[0] for k in ["您好", "你好", "我是", "请问"]):
+        did_well.append("开场有自我介绍/说明来意")
+    if hits(sales or [], VALUE):
+        did_well.append("有尝试用价值/收益来打动客户")
+    if not did_well:
+        did_well.append("（基础规则未识别到明显亮点，建议结合录音人工确认）")
+
+    # 待改进
+    to_improve = []
+    if over_hits:
+        to_improve.append("避免过度承诺，先确认实际情况再答复，更显专业")
+    if objections:
+        to_improve.append("对客户提出的顾虑，给出具体可执行的方案，而不是只说'放心/没问题'")
+    if not hits(all_lines, ["下周", "明天", "周一", "周二", "周三", "周四", "周五", "几点", "号", "约个时间"]):
+        to_improve.append("没有为下一步设定明确的时间点，容易跟丢")
+    if hits(sales or [], ["便宜", "优惠", "降"]) and not hits(sales or [], VALUE):
+        to_improve.append("客户嫌贵时不要急着降价，先讲清楚价值再谈价格")
+    if not to_improve:
+        to_improve.append("整体可圈可点，建议把客户的关键顾虑逐条闭环跟进")
+
+    # 遗漏动作
+    missed = []
+    if not hits(all_lines, ["决策", "拍板", "老板", "负责人", "谁定", "您定", "你定"]):
+        missed.append("未确认决策人/决策流程（最终谁拍板）")
+    if not hits(all_lines, ["邮箱", "微信", "电话", "号码", "联系方式", "发您", "发你"]):
+        missed.append("未索要/确认联系方式，方便后续发资料")
+    if not hits(all_lines, ["下周", "明天", "周二", "约", "几点", "下次"]):
+        missed.append("未约定下一次具体沟通时间")
+    if not missed:
+        missed.append("关键动作基本覆盖（基础规则检查）")
+
+    next_step = "尽快把相关方案/案例发给客户，并主动约定下一次沟通的具体时间。"
+    golden = _dedup(hits(sales or [], VALUE), 2) or ["（本通暂未识别到可复用金句）"]
+
+    # 评分：基础分 85，按问题扣分
+    score = 85
+    score -= 10 * len(over_hits[:1])
+    score -= 5 if objections else 0
+    score -= 3 * len([m for m in missed if "未" in m])
+    score = max(40, min(95, score))
+
+    return {
+        "customer": {"name": "（未自动识别，可人工补充）", "role": "—", "industry": "—"},
+        "demand": demand or ["（未自动识别到明确需求，建议结合录音确认）"],
+        "budget": budget,
+        "objections": objections or ["（未自动识别到明确异议）"],
+        "did_well": did_well,
+        "to_improve": to_improve,
+        "missed_actions": missed,
+        "next_step": next_step,
+        "compliance": compliance,
+        "golden_lines": golden,
+        "score": str(score),
+        "_engine": "offline",
+    }
+
+
 def render_markdown(data: dict) -> str:
     """把复盘 JSON 渲染成易读的 markdown 表格。"""
     c = data.get("customer", {})
@@ -306,12 +430,13 @@ def main() -> int:
     base_url = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1")
     model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
 
-    if args.mock or not api_key:
-        if not args.mock:
-            print("[提示] 未检测到 LLM_API_KEY，使用离线示例结果演示。\n"
-                  "       如需接入真实大模型，请设置 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL。\n",
-                  file=sys.stderr)
+    if args.mock:
         data = mock_result()
+    elif not api_key:
+        print("[提示] 未检测到 LLM_API_KEY，使用【离线规则分析】（基于你上传的真实内容，不调用 AI）。\n"
+              "       想要更细致的分析，可设置 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL。\n",
+              file=sys.stderr)
+        data = heuristic_result(transcript)
     else:
         print(f"[提示] 正在调用大模型（{model}）生成复盘……\n", file=sys.stderr)
         try:

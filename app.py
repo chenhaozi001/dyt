@@ -68,7 +68,7 @@ with st.sidebar:
     model = st.text_input("模型名称", value=default_model)
 
     if not api_key:
-        st.info("未填写 Key，点击分析将显示**示例结果**，方便先看效果。")
+        st.info("没填 Key 也能用：会用**离线规则**分析你上传的真实文件。填了免费 Key 分析会更细致。")
 
 # ---------- 主体 ----------
 uploaded = st.file_uploader(
@@ -88,7 +88,8 @@ st.warning(
 
 def render_result(data, demo_mode):
     if demo_mode:
-        st.info("💡 这是**示例结果**（未填 AI Key）。要分析真实录音，请在左侧填入接口 Key。")
+        st.info("💡 当前是**离线分析**（没填 AI Key 也能用）：以下结果是根据你上传的真实文件、"
+                "用关键词规则分析得出的，可直接参考。想要更细致的分析，可在左侧填入免费 AI Key 升级。")
 
     c = data.get("customer", {})
     score = data.get("score", "—")
@@ -157,4 +158,6 @@ if go:
                 st.stop()
         render_result(data, demo_mode=False)
     else:
-        render_result(call_review.mock_result(), demo_mode=True)
+        with st.spinner("正在离线分析你的文件…"):
+            data = call_review.heuristic_result(transcript)
+        render_result(data, demo_mode=True)

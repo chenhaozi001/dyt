@@ -148,8 +148,8 @@ PAGE_FOOT = """
 def index_page():
     has_key = bool(os.environ.get("LLM_API_KEY"))
     banner = "" if has_key else (
-        '<div class="demo-banner">💡 当前未配置大模型接口，点击分析会显示<b>示例结果</b>，'
-        '方便你先看效果。要分析你<b>真实</b>的录音，请在下方「高级设置」里填入公司提供的接口信息。</div>'
+        '<div class="demo-banner">💡 没配 AI 接口也能用：会用<b>离线规则</b>分析你上传的真实文件。'
+        '想要更细致的分析，可在下方「高级设置」里填入（免费的）AI 接口信息。</div>'
     )
     return PAGE_HEAD + f"""
 <div class="card">
@@ -200,8 +200,9 @@ def result_page(data, demo_mode, error=None):
 
     c = data.get("customer", {})
     demo_note = ("" if not demo_mode else
-                 '<div class="demo-banner">💡 这是<b>示例结果</b>（未配置大模型）。'
-                 '要分析你真实的录音，请返回首页在「高级设置」里填接口信息。</div>')
+                 '<div class="demo-banner">💡 当前是<b>离线分析</b>（没填 Key 也能用）：'
+                 '以下结果根据你上传的真实文件、用关键词规则分析得出。'
+                 '想要更细致的分析，可返回首页在「高级设置」里填免费 AI Key。</div>')
     body = f"""<div class="card">
   {demo_note}
   <div style="text-align:center;margin-bottom:10px;">
@@ -338,7 +339,7 @@ class Handler(BaseHTTPRequestHandler):
                         error=f"调用大模型失败：{e}。请检查 Key / 接口地址 / 模型名是否正确。"))
                     return
             else:
-                data = call_review.mock_result()
+                data = call_review.heuristic_result(transcript)
                 self._send_html(result_page(data, demo_mode=True))
         except Exception as e:  # noqa: BLE001
             self._send_html(result_page(None, False, error=f"服务器出错：{e}"))
