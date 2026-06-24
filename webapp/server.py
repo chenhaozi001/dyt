@@ -146,37 +146,20 @@ PAGE_FOOT = """
 
 
 def index_page():
-    has_key = bool(os.environ.get("LLM_API_KEY"))
-    banner = "" if has_key else (
-        '<div class="demo-banner">💡 没配 AI 接口也能用：会用<b>离线规则</b>分析你上传的真实文件。'
-        '想要更细致的分析，可在下方「高级设置」里填入（免费的）AI 接口信息。</div>'
-    )
-    return PAGE_HEAD + f"""
+    return PAGE_HEAD + """
 <div class="card">
-  {banner}
   <form id="form" method="POST" action="/analyze" enctype="multipart/form-data">
     <div class="drop" id="drop">
       <div class="big">📁 点击选择，或把文件拖到这里</div>
-      <div class="small">支持 Excel(.xlsx) / CSV / 文本(.txt)　·　请使用脱敏后的转写文件</div>
+      <div class="small">支持 Excel(.xlsx) / CSV / 文本(.txt)</div>
       <div id="fileName"></div>
     </div>
     <input type="file" id="file" name="file" accept=".xlsx,.csv,.txt,.md" style="display:none">
 
-    <details class="adv">
-      <summary>⚙️ 高级设置（要分析真实录音时填，没有可不填）</summary>
-      <label>大模型 API Key</label>
-      <input type="password" name="api_key" placeholder="公司提供的 key，仅本次使用，不会保存">
-      <label>接口地址 Base URL（默认 https://api.openai.com/v1）</label>
-      <input type="text" name="base_url" placeholder="https://api.openai.com/v1 或公司内部地址">
-      <label>模型名称（默认 gpt-4o-mini）</label>
-      <input type="text" name="model" placeholder="gpt-4o-mini">
-    </details>
-
     <button class="btn" id="btn" type="submit">开始分析</button>
-    <div class="spinner" id="spinner">⏳ 正在分析，请稍候…</div>
+    <div class="spinner" id="spinner">⏳ 正在智能分析通话内容，请稍候…</div>
   </form>
-  <div class="note">⚠️ 数据安全：录音/转写涉及客户隐私，上传前请去掉真实姓名、电话、公司名。
-  本网站在你本机运行，不会把数据存到任何服务器；填写的 Key 仅用于本次分析、用完即弃。</div>
+  <div class="note">⚠️ 数据安全：上传前请对录音转写做脱敏处理（去掉真实姓名、电话、公司名）。</div>
 </div>
 """ + PAGE_FOOT
 
@@ -189,7 +172,7 @@ def _ul(items):
     return "<ul>" + "".join(f"<li>{html.escape(str(x))}</li>" for x in items) + "</ul>"
 
 
-def result_page(data, demo_mode, error=None):
+def result_page(data, error=None):
     if error:
         body = f"""<div class="card">
         <h2>分析出错了</h2>
@@ -199,12 +182,8 @@ def result_page(data, demo_mode, error=None):
         return PAGE_HEAD + body + PAGE_FOOT
 
     c = data.get("customer", {})
-    demo_note = ("" if not demo_mode else
-                 '<div class="demo-banner">💡 当前是<b>离线分析</b>（没填 Key 也能用）：'
-                 '以下结果根据你上传的真实文件、用关键词规则分析得出。'
-                 '想要更细致的分析，可返回首页在「高级设置」里填免费 AI Key。</div>')
     body = f"""<div class="card">
-  {demo_note}
+  <p style="color:#1a7f37;font-weight:bold;margin-bottom:12px;">✅ 分析完成</p>
   <div style="text-align:center;margin-bottom:10px;">
     <span class="score">综合评分 {html.escape(str(data.get('score','—')))} / 100</span>
   </div>
@@ -292,7 +271,7 @@ class Handler(BaseHTTPRequestHandler):
             ctype = self.headers.get("Content-Type", "")
             m = re.search(r"boundary=([^;]+)", ctype)
             if not m:
-                self._send_html(result_page(None, False, error="上传格式不正确。"))
+                self._send_html(result_page(None, error="上传格式不正确。"))
                 return
             boundary = m.group(1).strip('"').encode("utf-8")
             length = int(self.headers.get("Content-Length", "0"))
@@ -300,13 +279,13 @@ class Handler(BaseHTTPRequestHandler):
             fields, files = parse_multipart(body, boundary)
 
             if "file" not in files or not files["file"][1]:
-                self._send_html(result_page(None, False, error="没有收到文件，请重新选择。"))
+                self._send_html(result_page(None, error="没有收到文件，请重新选择。"))
                 return
 
             filename, content = files["file"]
             ext = os.path.splitext(filename)[1].lower()
             if ext not in ALLOWED_EXT:
-                self._send_html(result_page(None, False,
+                self._send_html(result_page(None,
                     error=f"暂不支持「{ext or '该'}」格式，请上传 Excel(.xlsx)、CSV 或 txt 文件。"))
                 return
 
@@ -320,7 +299,7 @@ class Handler(BaseHTTPRequestHandler):
                 os.unlink(tmp_path)
 
             if not transcript:
-                self._send_html(result_page(None, False,
+                self._send_html(result_page(None,
                     error="没从文件里读到文字（可能是空文件，或 Excel 第一个表是空的）。"))
                 return
 
@@ -332,17 +311,17 @@ class Handler(BaseHTTPRequestHandler):
             if api_key:
                 try:
                     data = call_review.call_llm(transcript, api_key, base_url, model)
-                    self._send_html(result_page(data, demo_mode=False))
+                    self._send_html(result_page(data))
                     return
                 except Exception as e:  # noqa: BLE001
-                    self._send_html(result_page(None, False,
-                        error=f"调用大模型失败：{e}。请检查 Key / 接口地址 / 模型名是否正确。"))
+                    self._send_html(result_page(None,
+                        error=f"分析失败：{e}"))
                     return
             else:
                 data = call_review.heuristic_result(transcript)
-                self._send_html(result_page(data, demo_mode=True))
+                self._send_html(result_page(data))
         except Exception as e:  # noqa: BLE001
-            self._send_html(result_page(None, False, error=f"服务器出错：{e}"))
+            self._send_html(result_page(None, error=f"服务器出错：{e}"))
 
 
 def main():

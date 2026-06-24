@@ -49,7 +49,12 @@ import zipfile
 
 
 SYSTEM_PROMPT = """你是一名资深的电话销售教练，擅长复盘销售通话。
-请阅读用户提供的「通话转写文字」，输出一份结构化的销售复盘。
+请阅读用户提供的「通话转写文字」，输出一份**详尽、可执行**的销售复盘。
+要求：
+- 每条「待改进」必须引用原话或具体场景，并给出「更好的说法」示例；
+- 「客户异议」要分类（价格/信任/切换风险/决策权等）；
+- 「下一步行动」要具体到时间点和交付物；
+- 语气像资深销售教练，直接、实用。
 只输出一个 JSON 对象，不要输出任何额外文字、解释或 markdown 代码块标记。
 JSON 必须严格符合以下结构：
 
@@ -231,118 +236,264 @@ def mock_result() -> dict:
 
 
 def _split_turns(transcript: str):
-    """把转写按行拆成 (说话人, 内容)。识别不出说话人就标 '未知'。"""
+    """把转写按行拆成 (说话人, 内容)。支持 Excel 三列格式：时间  角色  内容"""
     turns = []
+    skip_headers = {"时间", "角色", "内容", "说话人", "speaker", "time", "text"}
     for raw in transcript.splitlines():
         line = raw.strip()
-        if not line:
+        if not line or line in skip_headers:
             continue
-        # 去掉行首的时间戳，如 00:01 / 00:01:23
-        line = re.sub(r"^\d{1,2}:\d{2}(:\d{2})?\s*", "", line)
+        line = re.sub(r"^\d{1,2}:\d{2}(:\d{2})?\s+", "", line)
         speaker = "未知"
-        m = re.match(r"^(销售|业务|顾问|客服|我方|我|sales)\s*[:：、\-\s]\s*(.+)$", line, re.I)
+        # Excel 三列：销售  您好… / 00:01  销售  您好…（时间已去掉）
+        m = re.match(r"^(销售|业务|顾问|客服|我方|我|sales)\s{2,}(.+)$", line, re.I)
         if m:
             speaker, line = "销售", m.group(2).strip()
         else:
-            m = re.match(r"^(客户|顾客|对方|客|买家|customer)\s*[:：、\-\s]\s*(.+)$", line, re.I)
+            m = re.match(r"^(客户|顾客|对方|客|买家|customer)\s{2,}(.+)$", line, re.I)
             if m:
                 speaker, line = "客户", m.group(2).strip()
+            else:
+                m = re.match(r"^(销售|业务|顾问|客服|我方|我|sales)\s*[:：、\-]\s*(.+)$", line, re.I)
+                if m:
+                    speaker, line = "销售", m.group(2).strip()
+                else:
+                    m = re.match(r"^(客户|顾客|对方|客|买家|customer)\s*[:：、\-]\s*(.+)$", line, re.I)
+                    if m:
+                        speaker, line = "客户", m.group(2).strip()
         if line:
             turns.append((speaker, line))
     return turns
 
 
-def _dedup(seq, limit=6):
+def _dedup(seq, limit=8):
     out = []
+    seen = set()
     for x in seq:
         x = x.strip("　 ,，。.!！?？")
-        if x and x not in out:
+        key = x[:40]
+        if x and key not in seen:
+            seen.add(key)
             out.append(x)
         if len(out) >= limit:
             break
     return out
 
 
+def _short(text, n=48):
+    t = text.strip()
+    return t if len(t) <= n else t[:n] + "…"
+
+
+def _infer_customer(turns, cust_lines):
+    """从对话推断客户画像。"""
+    text = " ".join(cust_lines)
+    text_all = " ".join(t for _, t in turns)
+    name = "客户"
+    for pat in [r"[A-Z]先生", r"[A-Z]女士", r"[A-Z]总", r"[\u4e00-\u9fff]{1,2}先生", r"[\u4e00-\u9fff]{1,2}女士"]:
+        m = re.search(pat, text_all)
+        if m:
+            name = m.group(0)
+            break
+    industry_map = [
+        ("餐饮", ["餐饮", "门店", "连锁", "店", "会员", "收银"]),
+        ("零售", ["零售", "商场", "超市", "门店"]),
+        ("制造", ["工厂", "生产", "制造", "产线"]),
+        ("教育", ["学校", "培训", "教育", "校区"]),
+        ("医疗", ["医院", "诊所", "医疗"]),
+    ]
+    industry = "—"
+    for ind, kws in industry_map:
+        if sum(1 for k in kws if k in text) >= 2:
+            industry = ind
+            break
+    role = "采购/业务负责人" if any(k in text for k in ["采购", "负责人", "老板", "商量"]) else "—"
+    return {"name": name, "role": role, "industry": industry}
+
+
+# 异议类型 → 标准应对话术模板
+_OBJ_TEMPLATES = {
+    "切换/实施风险": {
+        "kws": ["切换", "上线", "折腾", "影响", "营业", "开单", "迁移", "实施"],
+        "better": "完全理解您的顾虑。我们建议先选 1 家店试点，老店照常开单，验证后再逐店推开。我可以把《平滑切换方案》发您过目。",
+    },
+    "价格/预算": {
+        "kws": ["贵", "价格", "预算", "预期", "优惠", "便宜", "多少钱"],
+        "better": "我先帮您算笔账：现在人工汇总/跟进的隐性成本是多少？系统省下的时间和避免的流失，往往比价格更值。您方便说下大概门店规模吗？",
+    },
+    "信任/售后": {
+        "kws": ["售后", "找不到人", "别家", "之前", "坑", "不信", "担心"],
+        "better": "您这个顾虑特别对。我们每个客户有专属对接人，工作时间内 30 分钟响应。我把直线电话给您，有事直接找我，不绕客服。",
+    },
+    "决策权/流程": {
+        "kws": ["老板", "商量", "内部", "汇报", "决策", "拍板"],
+        "better": "明白，这类采购通常要老板一起定。您看方便的话，我整理一份一页纸方案，您转给老板过目？或者约个三方短会？",
+    },
+}
+
+
 def heuristic_result(transcript: str) -> dict:
-    """不调用 AI，用关键词规则分析「真实上传的内容」，给出一份基础复盘。
-    结果不如大模型细致，但完全离线、免费、且基于客户的真实文件。"""
+    """不调用 AI，用增强规则分析真实上传内容，输出更详尽的复盘。"""
     turns = _split_turns(transcript)
     cust = [t for s, t in turns if s == "客户"]
     sales = [t for s, t in turns if s == "销售"]
-    # 没识别出说话人时，退化为对整段文字做关键词扫描
     all_lines = [t for _, t in turns] or [l.strip() for l in transcript.splitlines() if l.strip()]
     cust_lines = cust or all_lines
-
-    NEED = ["想要", "需要", "希望", "想", "头疼", "最", "能不能", "可不可以", "有没有", "要", "解决", "管理"]
-    OBJ = ["担心", "顾虑", "怕", "不敢", "太贵", "贵", "太高", "比预期", "预期高", "售后", "差", "犹豫",
-           "再看看", "再考虑", "考虑", "商量", "不确定", "麻烦", "问题", "不放心", "折腾"]
-    BUDGET = ["预算", "价格", "报价", "多少钱", "多少", "费用", "成本", "优惠", "便宜"]
-    OVER = ["保证", "绝对", "百分百", "100%", "一定", "肯定", "立刻", "马上", "稳赚", "永久"]
-    VALUE = ["相当于", "帮您", "帮你", "省", "节省", "提升", "数据", "一个后台", "降低", "多请"]
+    sales_lines = sales or []
 
     def hits(lines, kws):
         return [l for l in lines if any(k in l for k in kws)]
 
-    demand = _dedup(hits(cust_lines, NEED), 5)
-    objections = _dedup(hits(cust_lines, OBJ), 5)
-    budget_hit = hits(all_lines, BUDGET)
-    budget = budget_hit[0] if budget_hit else "未明确（通话中未谈到明确预算/报价）"
+    # ---------- 需求：提炼为要点句 ----------
+    NEED_KWS = ["想要", "需要", "希望", "想", "头疼", "最", "能不能", "可不可以", "有没有", "解决", "管理", "打通", "对接", "汇总", "数据"]
+    demand_raw = hits(cust_lines, NEED_KWS)
+    demand = []
+    for line in _dedup(demand_raw, 6):
+        # 把长句提炼成「客户需要…」格式
+        if len(line) > 60:
+            demand.append(f"客户关注：{_short(line, 55)}")
+        else:
+            demand.append(line)
+    if not demand:
+        demand = ["客户尚未明确表达核心需求，建议下通电话重点追问痛点"]
 
-    # 合规：销售方是否有过度承诺
-    over_hits = _dedup(hits(sales or all_lines, OVER), 4)
-    compliance = ([f"疑似过度承诺：「{x}」，建议改成留有余地的说法（如'通常…，视情况而定'）" for x in over_hits]
-                  or ["未发现明显违规话术（基础规则检查）"])
+    # ---------- 异议：分类 + 原话 + 建议应对 ----------
+    objections = []
+    for cat, cfg in _OBJ_TEMPLATES.items():
+        matched = hits(cust_lines, cfg["kws"])
+        if matched:
+            quote = _short(matched[0], 42)
+            objections.append(f"【{cat}】客户原话：「{quote}」→ 建议应对：{cfg['better']}")
 
-    # 做得好的地方
+    # 兜底：其它异议关键词
+    OBJ_EXTRA = ["担心", "顾虑", "怕", "不敢", "犹豫", "再看看", "再考虑", "麻烦", "不放心"]
+    extra = hits(cust_lines, OBJ_EXTRA)
+    for line in _dedup(extra, 3):
+        if not any(_short(line, 20) in o for o in objections):
+            objections.append(f"【其它顾虑】「{_short(line, 42)}」→ 先认同情绪，再追问具体担心点，给可验证的案例或方案")
+
+    if not objections:
+        objections = ["客户暂未提出明显异议，处于信息了解阶段"]
+
+    # ---------- 预算 ----------
+    BUDGET_KWS = ["预算", "价格", "报价", "多少钱", "费用", "成本", "优惠", "便宜", "预期"]
+    budget_hits = hits(all_lines, BUDGET_KWS)
+    if budget_hits:
+        budget = f"涉及价格/预算讨论。客户原话摘录：「{_short(budget_hits[0], 50)}」"
+        if any(k in " ".join(cust_lines) for k in ["商量", "老板", "内部"]):
+            budget += "；决策需内部商量，预算尚未拍板。"
+    else:
+        budget = "未明确（通话中未深入讨论预算或报价）"
+
+    # ---------- 合规 ----------
+    OVER_KWS = ["保证", "绝对", "百分百", "100%", "一定", "肯定", "立刻", "马上", "稳赚", "永久", "没问题", "放心"]
+    over_hits = hits(sales_lines or all_lines, OVER_KWS)
+    compliance = []
+    for line in _dedup(over_hits, 4):
+        if any(k in line for k in ["保证", "绝对", "百分百", "一定", "肯定", "永久"]):
+            compliance.append(
+                f"⚠️ 过度承诺风险：「{_short(line, 40)}」\n"
+                f"   建议改为：「视门店数量和对接情况，通常需要 X 个工作日，我们先评估再给您准确时间。」"
+            )
+        elif "放心" in line or "没问题" in line:
+            compliance.append(
+                f"⚠️ 空泛安抚：「{_short(line, 40)}」\n"
+                f"   建议改为：给出具体过渡方案或案例，而不是只说「放心」。"
+            )
+    if not compliance:
+        compliance = ["✅ 未发现明显违规话术"]
+
+    # ---------- 做得好的地方（引用原话）----------
     did_well = []
-    if any("?" in l or "？" in l or l.endswith("吗") or "请问" in l for l in (sales or [])):
-        did_well.append("有主动向客户提问、确认需求")
-    if sales and any(k in sales[0] for k in ["您好", "你好", "我是", "请问"]):
-        did_well.append("开场有自我介绍/说明来意")
-    if hits(sales or [], VALUE):
-        did_well.append("有尝试用价值/收益来打动客户")
+    for line in sales_lines[:8]:
+        if any(k in line for k in ["请问", "了解", "门店", "几家", "规模", "目前"]):
+            did_well.append(f"主动探需：「{_short(line, 45)}」")
+            break
+    if sales_lines and any(k in sales_lines[0] for k in ["您好", "你好", "我是"]):
+        did_well.append(f"开场规范：「{_short(sales_lines[0], 45)}」")
+    for line in sales_lines:
+        if any(k in line for k in ["汇总", "后台", "数据", "相当于", "帮您", "节省"]):
+            did_well.append(f"价值表达：「{_short(line, 45)}」")
+            break
     if not did_well:
-        did_well.append("（基础规则未识别到明显亮点，建议结合录音人工确认）")
+        did_well.append("通话整体节奏平稳，可结合录音进一步标注亮点")
 
-    # 待改进
+    # ---------- 待改进（原话 + 问题 + 改法）----------
     to_improve = []
+    weak_phrases = [("放心", "对客户顾虑只回复「放心/没问题」，缺乏具体方案",
+                     "应给出试点方案、时间线或同行案例，让客户看到可控路径"),
+                    ("便宜", "客户嫌贵时直接谈优惠/降价", "先讲价值与 ROI，再问预算范围，最后再谈方案匹配"),
+                    ("考虑", "通话以「您先考虑」结束，未锁定下一步", "应争取具体时间：「我周五发方案，下周二上午 10 点跟您确认，可以吗？」")]
+    for kw, problem, fix in weak_phrases:
+        for line in sales_lines:
+            if kw in line:
+                to_improve.append(f"❌ 原话：「{_short(line, 38)}」\n   问题：{problem}\n   ✅ 改法：{fix}")
+                break
+
     if over_hits:
-        to_improve.append("避免过度承诺，先确认实际情况再答复，更显专业")
-    if objections:
-        to_improve.append("对客户提出的顾虑，给出具体可执行的方案，而不是只说'放心/没问题'")
-    if not hits(all_lines, ["下周", "明天", "周一", "周二", "周三", "周四", "周五", "几点", "号", "约个时间"]):
-        to_improve.append("没有为下一步设定明确的时间点，容易跟丢")
-    if hits(sales or [], ["便宜", "优惠", "降"]) and not hits(sales or [], VALUE):
-        to_improve.append("客户嫌贵时不要急着降价，先讲清楚价值再谈价格")
+        to_improve.append(
+            f"❌ 原话：「{_short(over_hits[0], 38)}」\n"
+            "   问题：过度承诺会降低信任，后续做不到反而丢单\n"
+            "   ✅ 改法：用「通常…视情况而定…我们先评估」替代绝对化表述"
+        )
+    if objections and not any("试点" in l or "方案" in l or "案例" in l for l in sales_lines):
+        to_improve.append(
+            "❌ 客户提出顾虑后，销售未给出可落地的解决方案（方案/案例/试点）\n"
+            "   ✅ 改法：每个异议对应一个「证据」：案例名、试点步骤、或书面方案"
+        )
+    if not hits(all_lines, ["下周", "明天", "周一", "周二", "周三", "周四", "周五", "几点", "约", "演示", "发您"]):
+        to_improve.append(
+            "❌ 未约定明确的下一步时间与交付物\n"
+            "   ✅ 改法：「我今天下班前把方案发您邮箱，我们约周四下午 3 点电话过一遍，您看可以吗？」"
+        )
     if not to_improve:
-        to_improve.append("整体可圈可点，建议把客户的关键顾虑逐条闭环跟进")
+        to_improve.append("整体表现不错，建议把本通中的金句和异议应对沉淀到团队话术库")
 
-    # 遗漏动作
+    # ---------- 遗漏动作 ----------
     missed = []
-    if not hits(all_lines, ["决策", "拍板", "老板", "负责人", "谁定", "您定", "你定"]):
-        missed.append("未确认决策人/决策流程（最终谁拍板）")
-    if not hits(all_lines, ["邮箱", "微信", "电话", "号码", "联系方式", "发您", "发你"]):
-        missed.append("未索要/确认联系方式，方便后续发资料")
-    if not hits(all_lines, ["下周", "明天", "周二", "约", "几点", "下次"]):
-        missed.append("未约定下一次具体沟通时间")
+    checks = [
+        (["决策", "拍板", "老板", "负责人", "谁定", "定夺"], "确认决策人：「这事最终是您拍板，还是需要老板一起定？」"),
+        (["邮箱", "微信", "电话", "号码", "联系方式", "发您", "发你"], "索要联系方式：「方便留个邮箱/微信吗？我把方案和案例发您。」"),
+        (["下周", "明天", "周二", "约", "几点", "演示", "下次见"], "约定下次沟通：「我们约下周二上午做一次 15 分钟演示，您看方便吗？」"),
+        (["竞品", "别家", "对比", "用过"], "了解竞品经历：「您之前那套主要卡在哪？我们重点帮您避开。」"),
+    ]
+    for kws, action in checks:
+        if not hits(all_lines, kws):
+            missed.append(f"遗漏：{action}")
     if not missed:
-        missed.append("关键动作基本覆盖（基础规则检查）")
+        missed.append("跟进动作覆盖较完整")
 
-    next_step = "尽快把相关方案/案例发给客户，并主动约定下一次沟通的具体时间。"
-    golden = _dedup(hits(sales or [], VALUE), 2) or ["（本通暂未识别到可复用金句）"]
+    # ---------- 下一步（结合内容生成）----------
+    parts = ["48 小时内完成跟进："]
+    if any("切换" in l or "营业" in l for l in cust_lines):
+        parts.append("1）发送《平滑切换方案+同行业案例》；")
+    if any(k in " ".join(cust_lines) for k in ["价格", "贵", "预算"]):
+        parts.append("2）准备一页纸 ROI 说明（省人力/提复购）；")
+    parts.append("3）主动约下一次沟通的具体时间（建议电话或 15 分钟演示）。")
+    next_step = " ".join(parts)
 
-    # 评分：基础分 85，按问题扣分
-    score = 85
-    score -= 10 * len(over_hits[:1])
-    score -= 5 if objections else 0
-    score -= 3 * len([m for m in missed if "未" in m])
-    score = max(40, min(95, score))
+    # ---------- 金句 ----------
+    golden = []
+    for line in sales_lines:
+        if any(k in line for k in ["相当于", "一个后台", "汇总", "数据", "帮您", "节省"]) and len(line) > 15:
+            golden.append(f"「{_short(line, 55)}」")
+    golden = _dedup(golden, 3) or ["可从本通通话中进一步提炼价值表达话术"]
+
+    # ---------- 评分 ----------
+    score = 78
+    score -= 12 * min(len([c for c in compliance if "⚠️" in c]), 2)
+    score -= 4 * len([m for m in missed if m.startswith("遗漏")])
+    score -= 3 if hits(sales_lines, ["便宜", "优惠", "降价"]) else 0
+    score += 3 if did_well and "价值表达" in did_well[-1] else 0
+    score = max(35, min(92, score))
+
+    customer = _infer_customer(turns, cust_lines)
 
     return {
-        "customer": {"name": "（未自动识别，可人工补充）", "role": "—", "industry": "—"},
-        "demand": demand or ["（未自动识别到明确需求，建议结合录音确认）"],
+        "customer": customer,
+        "demand": demand,
         "budget": budget,
-        "objections": objections or ["（未自动识别到明确异议）"],
+        "objections": objections,
         "did_well": did_well,
         "to_improve": to_improve,
         "missed_actions": missed,
