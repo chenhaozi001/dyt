@@ -290,7 +290,7 @@ def _infer_customer(turns, cust_lines):
     text = " ".join(cust_lines)
     text_all = " ".join(t for _, t in turns)
     name = "客户"
-    for pat in [r"[A-Z]先生", r"[A-Z]女士", r"[A-Z]总", r"[\u4e00-\u9fff]{1,2}先生", r"[\u4e00-\u9fff]{1,2}女士"]:
+    for pat in [r"[A-Z]\s*先生", r"[A-Z]\s*女士", r"[A-Z]\s*总", r"[\u4e00-\u9fff]{1,2}\s*先生", r"[\u4e00-\u9fff]{1,2}\s*女士"]:
         m = re.search(pat, text_all)
         if m:
             name = m.group(0)
