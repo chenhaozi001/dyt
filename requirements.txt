@@ -1,3 +1,8 @@
-# 三个 demo 脚本（call_review/script_gen/kb_qa）只用 Python 标准库，无需安装任何依赖。
-# 下面这个依赖仅在「用 tools/build_pptx.py 生成 .pptx」时需要：
+# 命令行三个 demo（call_review/script_gen/kb_qa）和本地网页版 webapp/server.py
+# 都只用 Python 标准库，无需安装任何依赖。
+
+# 在线版网页（app.py，用于免费部署到 Streamlit Community Cloud）需要：
+streamlit>=1.31.0
+
+# 仅在「用 tools/build_pptx.py 生成 .pptx」时需要：
 python-pptx>=0.6.21
