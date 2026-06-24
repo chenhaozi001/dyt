@@ -352,10 +352,16 @@ def main():
     print(f"  请在浏览器打开： {url}")
     print("  (关闭这个窗口即可停止网站)")
     print("=" * 50)
-    try:
-        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
-    except Exception:
-        pass
+    sys.stdout.flush()
+    # 仅在有图形界面的本机电脑上自动打开浏览器；
+    # 服务器/无界面环境（如云端）跳过，避免报错和无谓的日志。
+    want_browser = os.environ.get("OPEN_BROWSER", "auto")
+    has_display = bool(os.environ.get("DISPLAY") or sys.platform in ("darwin", "win32"))
+    if want_browser == "1" or (want_browser == "auto" and has_display):
+        try:
+            threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+        except Exception:
+            pass
     try:
         server.serve_forever()
     except KeyboardInterrupt:
