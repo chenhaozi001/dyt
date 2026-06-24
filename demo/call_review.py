@@ -6,8 +6,13 @@
 用途：把一段「通话录音转写文字」自动整理成结构化的销售复盘表。
 适合在分享会上现场演示：左边放转写文字，右边 2 秒生成复盘。
 
+支持的输入文件：.txt / .md / .csv / .xlsx（Excel）
+  - Excel/CSV：脚本会把所有单元格的文字按行读出来拼成转写文字，
+    所以不管你的表格是「时间/角色/内容」三列，还是把对话写在一列里，都能用。
+  - 解析 Excel 用的是 Python 标准库，无需安装任何依赖。
+
 两种运行模式：
-  1) 真·AI 模式：配置好兼容 OpenAI 的接口（公司内部接口 / 扣子 / 任意大模型），
+  1) 真·AI 模式：配置好兼容 OpenAI 的接口（公司内部接口 / 任意大模型），
      脚本会真的调用大模型来生成复盘。
   2) 离线 Demo 模式：没有配置任何接口时，自动用内置的示例结果演示效果，
      断网也能现场跑，不会报错、不会把客户数据传出去。
@@ -16,11 +21,14 @@
   # 离线演示（最稳，适合现场）
   python demo/call_review.py --input samples/sample_call.txt
 
+  # 用 Excel 文件作为输入
+  python demo/call_review.py --input 我的录音转写.xlsx
+
   # 接入真实大模型（OpenAI 兼容接口）
   export LLM_API_KEY="你的key"
-  export LLM_BASE_URL="https://api.openai.com/v1"   # 或公司内部/扣子的兼容地址
+  export LLM_BASE_URL="https://api.openai.com/v1"   # 或公司内部兼容地址
   export LLM_MODEL="gpt-4o-mini"
-  python demo/call_review.py --input samples/sample_call.txt
+  python demo/call_review.py --input 我的录音转写.xlsx
 
   # 把结果同时导出成 markdown 文件
   python demo/call_review.py --input samples/sample_call.txt --out 复盘结果.md
@@ -29,11 +37,15 @@
 """
 
 import argparse
+import csv
 import json
 import os
+import re
 import sys
 import urllib.request
 import urllib.error
+import xml.etree.ElementTree as ET
+import zipfile
 
 
 SYSTEM_PROMPT = """你是一名资深的电话销售教练，擅长复盘销售通话。
@@ -59,6 +71,78 @@ JSON 必须严格符合以下结构：
   "score": "本通电话综合评分（0-100 的整数，字符串）"
 }
 """
+
+
+def read_input(path: str) -> str:
+    """根据扩展名读取输入，统一返回转写文字。
+    支持 .txt/.md（纯文本）、.csv、.xlsx（Excel）。"""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".txt", ".md", ""):
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    if ext == ".csv":
+        return _read_csv(path)
+    if ext == ".xlsx":
+        return _read_xlsx(path)
+    if ext == ".xls":
+        raise ValueError(
+            "暂不支持老版 .xls 格式，请在 Excel 里「另存为」.xlsx 后再试。"
+        )
+    # 其它后缀，尝试按纯文本读
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read().strip()
+
+
+def _read_csv(path: str) -> str:
+    """把 CSV 每行的非空单元格用空格连起来，行与行换行。"""
+    rows = []
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        for row in csv.reader(f):
+            cells = [c.strip() for c in row if c and c.strip()]
+            if cells:
+                rows.append("  ".join(cells))
+    return "\n".join(rows).strip()
+
+
+def _read_xlsx(path: str) -> str:
+    """仅用标准库解析 .xlsx：读取第一个工作表，按行拼出所有单元格文字。"""
+    ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    with zipfile.ZipFile(path) as z:
+        # 共享字符串表（Excel 把文本统一存这里）
+        shared = []
+        if "xl/sharedStrings.xml" in z.namelist():
+            root = ET.fromstring(z.read("xl/sharedStrings.xml"))
+            for si in root.findall("m:si", ns):
+                shared.append("".join(t.text or "" for t in si.iter("{%s}t" % ns["m"])))
+
+        # 找第一个工作表
+        sheet_names = [n for n in z.namelist()
+                       if re.match(r"xl/worksheets/sheet\d+\.xml$", n)]
+        if not sheet_names:
+            return ""
+        sheet_names.sort()
+        root = ET.fromstring(z.read(sheet_names[0]))
+
+        lines = []
+        for row in root.iter("{%s}row" % ns["m"]):
+            cells = []
+            for c in row.findall("m:c", ns):
+                t = c.get("t")
+                v = c.find("m:v", ns)
+                if t == "s" and v is not None:  # 共享字符串
+                    idx = int(v.text)
+                    if 0 <= idx < len(shared):
+                        cells.append(shared[idx])
+                elif t == "inlineStr":
+                    is_el = c.find("m:is", ns)
+                    if is_el is not None:
+                        cells.append("".join(x.text or "" for x in is_el.iter("{%s}t" % ns["m"])))
+                elif v is not None and v.text:
+                    cells.append(v.text)
+            cells = [c.strip() for c in cells if c and c.strip()]
+            if cells:
+                lines.append("  ".join(cells))
+        return "\n".join(lines).strip()
 
 
 def build_user_prompt(transcript: str) -> str:
@@ -195,7 +279,8 @@ def render_markdown(data: dict) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="通话录音复盘助手 Demo")
-    parser.add_argument("--input", "-i", required=True, help="通话转写文字的 txt 文件路径")
+    parser.add_argument("--input", "-i", required=True,
+                        help="通话转写文件路径，支持 .txt/.md/.csv/.xlsx")
     parser.add_argument("--out", "-o", help="可选：把复盘结果导出为 markdown 文件")
     parser.add_argument("--mock", action="store_true", help="强制使用离线示例结果")
     args = parser.parse_args()
@@ -204,11 +289,17 @@ def main() -> int:
         print(f"[错误] 找不到输入文件：{args.input}", file=sys.stderr)
         return 1
 
-    with open(args.input, "r", encoding="utf-8") as f:
-        transcript = f.read().strip()
+    try:
+        transcript = read_input(args.input)
+    except ValueError as e:
+        print(f"[错误] {e}", file=sys.stderr)
+        return 1
+    except Exception as e:  # noqa: BLE001
+        print(f"[错误] 读取输入文件失败：{e}", file=sys.stderr)
+        return 1
 
     if not transcript:
-        print("[错误] 输入文件是空的。", file=sys.stderr)
+        print("[错误] 没从输入文件里读到任何文字（可能是空文件，或 Excel 第一个表是空的）。", file=sys.stderr)
         return 1
 
     api_key = os.environ.get("LLM_API_KEY")
